@@ -1,0 +1,2 @@
+{
+ "name":"My Planner — 予定と To Do","short_name":"My Planner","description":"就活・研究・生活の予定とTo Doを管理。Google Sheets同期対応。","start_url":"./index.html","scope":"./","display":"standalone","background_color":"#f5f7fc","theme_color":"#f5f7fc","lang":"ja","icons":[{"src":"./icon-192.png","sizes":"192x192","type":"image/png","purpose":"any maskable"},{"src":"./icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}]}
