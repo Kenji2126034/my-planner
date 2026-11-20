@@ -8,7 +8,7 @@ const SCOPE='https://www.googleapis.com/auth/spreadsheets';
 const TAB='PlannerData';
 const HEADER=['Kind','ID','Title','Type','Date','Time','EndDate','EndTime','Category','Priority','Important','Completed','Notes','SubtasksJSON','CreatedAt','UpdatedAt','MetaJSON'];
 const DEFAULT={clientId:'',spreadsheetId:'',remoteHash:'',localSignature:'',autoSync:true};
-let config=readConfig(),token='',expires=0,tokenClient=null,pendingTimer=null,busy=false,authInProgress=false,initializing=false,lastStatus='local',lastError='',lastSyncedAt='',unsaved=false,interactivePending=false;
+let config=readConfig(),token='',expires=0,tokenClient=null,pendingTimer=null,busy=false,authInProgress=false,initializing=false,lastStatus='local',lastError='',lastSyncedAt='',unsaved=false,interactivePending=false,autoAttempted=false,autoAuth=false,authWatchdog=null;
 function readConfig(){try{return {...DEFAULT,...JSON.parse(localStorage.getItem(KEY)||'{}')}}catch{return {...DEFAULT}}}
 function persist(){try{localStorage.setItem(KEY,JSON.stringify(config))}catch(e){/* application local storage will still work */}}
 function bridge(){return window.MyPlannerBridge}
@@ -18,7 +18,7 @@ function signature(data){return digest(canonical(data))}
 function escapeHTML(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function msg(text,type){bridge()?.notify(text,type)}
 function status(st,reason=''){lastStatus=st;lastError=reason;renderStatus();window.dispatchEvent(new CustomEvent('myplanner:syncstate',{detail:{status:st}}))}
-function label(){if(lastStatus==='synced')return 'クラウド同期済み';if(lastStatus==='working')return '同期中…';if(lastStatus==='conflict')return '同期の競合あり';if(lastStatus==='error')return '同期エラー';if(lastStatus==='offline')return 'オフライン保存中';if(lastStatus==='dirty')return 'クラウド未反映';if(!config.clientId)return 'Google同期を設定';if(!config.spreadsheetId)return '保存先を作成';if(!token)return 'Googleへ接続';return '最新を確認'}
+function label(){if(lastStatus==='synced')return 'クラウド同期済み';if(lastStatus==='working')return '同期中…';if(lastStatus==='conflict')return '同期の競合あり';if(lastStatus==='error')return '同期エラー';if(lastStatus==='offline')return config.clientId?'Googleへ再接続':'オフライン保存中';if(lastStatus==='dirty')return 'クラウド未反映';if(!config.clientId)return 'Google同期を設定';if(!config.spreadsheetId)return '保存先を作成';if(!token)return 'Googleへ接続';return '最新を確認'}
 function renderStatus(){const text=label();for(const element of document.querySelectorAll('[data-sync-label]'))element.textContent=text;
  const pill=document.querySelector('#syncPill');if(pill){pill.dataset.syncState=lastStatus;pill.title=lastError?text+'：'+lastError:text}
  const st=document.querySelector('#syncModalStatus');if(st)st.textContent=text+(lastSyncedAt?' · 最終確認 '+lastSyncedAt:'');
@@ -31,14 +31,32 @@ function handleError(err){console.error('MyPlanner cloud sync:',err);let reason=
 function onRemoteChange(data){bridge()?.applyCloud({items:data.items,categories:data.categories});config.localSignature=signature(bridge()?.get());persist()}
 function initGIS(){if(!window.google?.accounts?.oauth2)throw Error('Googleログイン用ライブラリが読み込まれていません。ネット接続を確認してください。');
  if(!config.clientId)throw Error('先にOAuthクライアントIDを設定してください。');
+ // Reuse the client until the settings change; never store access tokens on disk.
+ if(tokenClient)return;
  tokenClient=window.google.accounts.oauth2.initTokenClient({client_id:config.clientId,scope:SCOPE,callback:response=>{
-    authInProgress=false;if(response.error){handleError(new Error(response.error));return}
-    token=response.access_token;expires=Date.now()+Number(response.expires_in||3500)*1000;
-    status('local','');msg('Googleアカウントに接続しました');
+    authInProgress=false;clearTimeout(authWatchdog);authWatchdog=null;
+    if(response.error){if(autoAuth){status('offline','自動接続できませんでした。右上の「Googleへ再接続」をクリックしてください。');}else handleError(new Error(response.error));autoAuth=false;return}
+    autoAuth=false;token=response.access_token;expires=Date.now()+Number(response.expires_in||3500)*1000;
+    status('local','');
     if(config.spreadsheetId)sync().catch(handleError);
+ },error_callback:err=>{
+    authInProgress=false;clearTimeout(authWatchdog);authWatchdog=null;
+    const silent=autoAuth;autoAuth=false;
+    if(silent){status('offline','Googleが自動認証を許可しませんでした。右上から1回クリックで再接続できます。');return}
+    handleError(new Error(err?.message||err?.type||'Google認証画面を開けませんでした'));
  }})}
-function connect(){if(location.protocol==='file:'){msg('Google同期にはHTTPS公開またはlocalhostでの起動が必要です。HTML単体ではローカル機能のみ使えます。','error');return}
- try{initGIS();authInProgress=true;tokenClient.requestAccessToken({prompt:'consent'});}catch(err){handleError(err)}}
+function connect({automatic=false}={}){
+ if(location.protocol==='file:'){if(!automatic)msg('Google同期にはHTTPS公開またはlocalhostでの起動が必要です。HTML単体ではローカル機能のみ使えます。','error');return}
+ if(authInProgress||token&&Date.now()<expires-3000){if(token&&config.spreadsheetId)sync().catch(handleError);return}
+ if(automatic&&(!navigator.onLine||document.visibilityState!=='visible'||!config.clientId||!config.spreadsheetId))return;
+ try{
+   initGIS();authInProgress=true;autoAuth=automatic;
+   // Google GIS may require a user gesture. Try once on load, then fall back to a one-click button.
+   clearTimeout(authWatchdog);authWatchdog=setTimeout(()=>{if(authInProgress){authInProgress=false;autoAuth=false;status('offline','再接続には右上のボタンをクリックしてください。')}},12000);
+   tokenClient.requestAccessToken({prompt:''}); // Never force repeat consent on every visit.
+ }catch(err){authInProgress=false;clearTimeout(authWatchdog);authWatchdog=null;autoAuth=false;if(automatic)status('offline','自動再接続ができません。右上から再接続してください。');else handleError(err)}
+}
+function tryAutoConnect(){if(autoAttempted||!config.clientId||!config.spreadsheetId)return;autoAttempted=true;connect({automatic:true})}
 async function api(path,{method='GET',body}={}){if(!token||Date.now()>expires-3000){token='';throw Error('Google接続の期限が切れました。「Googleに接続」を押してください。')}
  if(!navigator.onLine)throw Error('インターネット接続がありません。');
  const url='https://sheets.googleapis.com/v4/spreadsheets'+path;
@@ -139,25 +157,30 @@ function saveOptions(){const client=document.querySelector('#cloudClientId')?.va
  if(config.spreadsheetId!==sid){config.remoteHash='';config.localSignature=''}
  Object.assign(config,{clientId:client,spreadsheetId:sid,autoSync:auto});persist();status('local','');renderStatus();msg('Google同期の設定を保存しました')}
 function disconnect(){if(!window.confirm('Google同期を解除しますか？端末の予定は残ります。'))return;
- if(token&&window.google?.accounts?.oauth2?.revoke)try{window.google.accounts.oauth2.revoke(token,()=>{})}catch{}token='';expires=0;tokenClient=null;config={...DEFAULT};persist();status('local','');msg('同期を解除しました。端末データは残っています。')}
+ if(token&&window.google?.accounts?.oauth2?.revoke)try{window.google.accounts.oauth2.revoke(token,()=>{})}catch{}token='';expires=0;tokenClient=null;clearTimeout(authWatchdog);authInProgress=false;autoAuth=false;config={...DEFAULT};persist();status('local','');msg('同期を解除しました。端末データは残っています。')}
 function html(){return `<div class="sync-intro"><strong>Googleスプレッドシート同期</strong><p>OpenAI API・独自サーバー不要。Google Sheetsを保存先として、PCとスマホで同じ予定を扱えます。保存データはGoogleアカウント内に置かれます。</p>
 <details class="sync-advanced"><summary>初めて設定する方：手順を見る</summary><p>① このアプリをGitHub Pages等のHTTPSサイトで公開<br>② <a href="https://console.cloud.google.com/apis/library/sheets.googleapis.com" target="_blank" rel="noopener noreferrer">Google Sheets APIを有効化</a><br>③ <a href="https://console.cloud.google.com/auth/clients" target="_blank" rel="noopener noreferrer">Google Auth PlatformでOAuthクライアントIDを作成</a>（種類：ウェブアプリ）<br>④ 承認済みJavaScript生成元に公開したURLのオリジンを登録<br>⑤ この画面にClient IDを貼付 → 設定を保存 → Googleに接続 → 保存用シートを新規作成<br>⑥ 別端末でも同じClient IDとスプレッドシートIDを使う<br>※ 詳細な説明はZIP同梱READMEに記載しています。</p></details></div>
  <div class="cloud-status"><span class="sync-led"></span><span id="syncModalStatus">${escapeHTML(label())}</span></div><p id="syncModalError" class="sync-error" ${lastError?'':'hidden'}>${escapeHTML(lastError)}</p>
  <div class="field"><label for="cloudClientId">Google OAuth 2.0 クライアントID</label><input id="cloudClientId" type="text" autocomplete="off" spellcheck="false" placeholder="xxxxx.apps.googleusercontent.com" value="${escapeHTML(config.clientId)}"><small>Google Cloudで「ウェブアプリケーション」のOAuthクライアントを作成してください。Client IDは秘密鍵ではありません。</small></div>
  <div class="field"><label for="cloudSheetId">保存先スプレッドシートID（初回は空欄でOK）</label><input id="cloudSheetId" type="text" autocomplete="off" spellcheck="false" placeholder="Googleに接続後「新規作成」が可能" value="${escapeHTML(config.spreadsheetId)}"><small>既存の「My Planner｜予定データ」を使う場合はURLを貼り付けてもOKです。</small></div>
  <label class="cloud-checkbox"><input type="checkbox" id="cloudAutoSync" ${config.autoSync?'checked':''}><span>編集後に自動保存する（競合時は停止）</span></label>
- <div class="sync-toolbar"><button class="btn primary" data-action="sync-save">設定を保存</button><button class="btn" data-action="sync-login">Googleに接続</button><button class="btn" data-action="sync-create">保存用シートを新規作成</button></div>
+ <div class="sync-toolbar"><button class="btn primary" data-action="sync-save">設定を保存</button><button class="btn" data-action="sync-login">Googleに再接続</button><button class="btn" data-action="sync-create">保存用シートを新規作成</button></div>
  <div class="sync-toolbar"><button class="btn" data-action="sync-now">最新状態を同期</button><button class="btn" data-action="sync-pull">クラウドから読み込む</button><button class="btn" data-action="sync-push">端末から保存</button></div>
  <details class="sync-advanced"><summary>競合解決・接続解除</summary><p>両方が変更された場合、アプリは勝手に上書きしません。JSONバックアップを保存してから一方を選んでください。</p><button class="btn danger" data-action="sync-overwrite">この端末の内容でクラウドを強制上書き</button><button class="btn" data-action="sync-disconnect">Google同期を解除</button></details>
  ${config.spreadsheetId?`<p class="cloud-link"><a href="https://docs.google.com/spreadsheets/d/${encodeURIComponent(config.spreadsheetId)}/edit" target="_blank" rel="noopener noreferrer">保存先のGoogleスプレッドシートを開く ↗</a></p>`:''}
- <div class="info-card">${location.protocol==='file:'?'<strong>現在はローカルHTMLで開いています。Google同期にはHTTPS上のアプリ（GitHub Pagesなど）またはlocalhostが必要です。</strong><br>':''}Googleカレンダーへの連携はありません。Googleアカウントの許可画面で「スプレッドシートの表示と編集」を承認します。<br>Googleは、このアプリが作成・利用するファイルのアクセス許可を求めます。ログインが期限切れになった場合は「Googleに接続」を押してください。</div>`}
+ <div class="info-card">${location.protocol==='file:'?'<strong>現在はローカルHTMLで開いています。Google同期にはHTTPS上のアプリ（GitHub Pagesなど）またはlocalhostが必要です。</strong><br>':''}Googleカレンダーへの連携はありません。Googleアカウントの許可画面で「スプレッドシートの表示と編集」を承認します。<br>Googleは、このアプリが作成・利用するファイルのアクセス許可を求めます。Googleへはページ表示時に再接続を試します。Googleの仕様やブラウザ制限で自動認証できない場合は右上の「Googleへ再接続」をクリックしてください。</div>`}
 function onAction(action){switch(action){case'sync-save':saveOptions();break;case'sync-login':connect();break;case'sync-create':create();break;case'sync-now':sync();break;case'sync-pull':pull();break;case'sync-push':push();break;case'sync-overwrite':overwrite();break;case'sync-disconnect':disconnect();break;}}
 function onRender(){renderStatus()}
 function onInit(){window.addEventListener('myplanner:localchange',addLocalEvent);
+ // Allow reconnect directly from the status pill: no need to open the settings dialog.
+ document.addEventListener('click',e=>{const pill=e.target.closest?.('#syncPill');if(!pill)return;
+   if(config.clientId&&config.spreadsheetId&&(!token||Date.now()>=expires-3000)&&!authInProgress){e.preventDefault();e.stopImmediatePropagation();connect()}
+ },true);
  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&token&&config.spreadsheetId&&!busy)sync().catch(handleError)});
  window.setInterval(()=>{if(document.visibilityState==='visible'&&token&&config.spreadsheetId&&!busy)sync().catch(handleError)},90000);
  unsaved=signature(bridge()?.get())!==config.localSignature;status(!config.clientId?'local':'offline','');
- // Google login is deliberately not triggered on page load without user gesture.
+ // Best-effort reconnect, once per page load. Popup-blocked browsers require user click.
+ if(config.clientId&&config.spreadsheetId&&location.protocol!=='file:')setTimeout(tryAutoConnect,850);
 }
 window.MyPlannerSync={html,onAction,onRender,connect,sync,pull,push,create,saveOptions,digest,parseRows,serializeRows,signature,getState:()=>({status:lastStatus,config:{...config},authenticated:!!token,unsaved,lastError})};
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',onInit);else onInit();
